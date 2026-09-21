@@ -1,3 +1,4 @@
 <Solution>
+  <Project Path="TensionDev.Ddns.Cloudflare.Tests/TensionDev.Ddns.Cloudflare.Tests.csproj" />
   <Project Path="TensionDev.Ddns.Cloudflare/TensionDev.Ddns.Cloudflare.csproj" />
 </Solution>
