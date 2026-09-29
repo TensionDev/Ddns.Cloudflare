@@ -22,4 +22,8 @@
     <Using Include="Xunit" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\TensionDev.Ddns.Cloudflare\TensionDev.Ddns.Cloudflare.csproj" />
+  </ItemGroup>
+
 </Project>
