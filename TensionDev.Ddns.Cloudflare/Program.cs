@@ -1,3 +1,5 @@
+using TensionDev.Ddns.Cloudflare.Configuration;
+
 namespace TensionDev.Ddns.Cloudflare
 {
     public class Program
@@ -5,9 +7,11 @@ namespace TensionDev.Ddns.Cloudflare
         public static void Main(string[] args)
         {
             var builder = Host.CreateApplicationBuilder(args);
+
+            builder.Services.AddDdnsOptions(builder.Configuration);
             builder.Services.AddHostedService<Worker>();
 
-            var host = builder.Build();
+            using var host = builder.Build();
             host.Run();
         }
     }
