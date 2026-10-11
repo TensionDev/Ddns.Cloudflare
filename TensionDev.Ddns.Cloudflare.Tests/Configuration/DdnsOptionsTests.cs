@@ -146,18 +146,32 @@ namespace TensionDev.Ddns.Cloudflare.Tests.Configuration
                 "CHECK_INTERVAL= "
             ]);
             var logger = new CapturingLogger<Worker>();
+            var reconciliationStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             using var host = new HostBuilder()
                 .ConfigureServices(services =>
                 {
                     services.AddDdnsOptions(configuration);
-                    services.AddSingleton<IDdnsReconciler>(new StubReconciler(_ => Task.CompletedTask));
+                    services.AddSingleton<IDdnsReconciler>(new StubReconciler(_ =>
+                    {
+                        reconciliationStarted.TrySetResult();
+                        return Task.CompletedTask;
+                    }));
                     services.AddSingleton(TimeProvider.System);
                     services.AddSingleton<Microsoft.Extensions.Logging.ILogger<Worker>>(logger);
                     services.AddHostedService<Worker>();
                 })
                 .Build();
             await host.StartAsync(TestContext.Current.CancellationToken);
-            await host.StopAsync(TestContext.Current.CancellationToken);
+            try
+            {
+                // Host startup can complete before the background worker is scheduled.
+                // Wait for actual work, which follows the worker's startup log messages.
+                await reconciliationStarted.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            }
+            finally
+            {
+                await host.StopAsync(TestContext.Current.CancellationToken);
+            }
 
             Assert.Equal(TimeSpan.FromHours(1), host.Services.GetRequiredService<IOptions<DdnsOptions>>().Value.CheckInterval);
             Assert.NotEmpty(logger.Messages);
