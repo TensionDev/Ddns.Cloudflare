@@ -16,6 +16,9 @@ namespace TensionDev.Ddns.Cloudflare.Configuration
         {
             services.AddOptions<DdnsOptions>().Configure(options =>
             {
+                options.PublicIpProvider = configuration["PUBLIC_IP_PROVIDER"];
+                options.CloudflarePublicIpUrl = Uri.TryCreate(configuration["PUBLIC_IP_CLOUDFLARE_URL"], UriKind.Absolute, out var publicIpUrl)
+                    ? publicIpUrl : null;
                 options.Cloudflare.ApiToken = configuration["CLOUDFLARE_API_TOKEN"] ?? string.Empty;
                 options.Cloudflare.Zone = configuration["CLOUDFLARE_ZONE"] ?? string.Empty;
                 options.Cloudflare.Records = configuration["CLOUDFLARE_RECORDS"]
@@ -46,6 +49,8 @@ namespace TensionDev.Ddns.Cloudflare.Configuration
              .Validate(options => options.CheckInterval > TimeSpan.Zero && options.CheckInterval.TotalMilliseconds <= uint.MaxValue - 1,
                   "CHECK_INTERVAL must be a positive time span no greater than 49.17:02:47.294 (for example 01:00:00).")
             .ValidateOnStart();
+
+            services.AddSingleton<IValidateOptions<DdnsOptions>, PublicIpProviderOptionsValidator>();
 
             return services;
         }

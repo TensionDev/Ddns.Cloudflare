@@ -1,91 +1,131 @@
-using Microsoft.Extensions.Logging;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using TensionDev.Ddns.Cloudflare.Configuration;
 
-namespace TensionDev.Ddns.Cloudflare.Tests
+namespace TensionDev.Ddns.Cloudflare.Tests;
+
+public class WorkerTests
 {
-     /// <summary>
-     /// Verifies the background-service execution model from ADR-0002: the worker honours
-     /// the host cancellation token, repeats its reconciliation cycle at the configured
-     /// interval, and shuts down gracefully. The per-cycle reconciliation is a placeholder
-     /// that ADR-0003/ADR-0004 will fill in, so these tests assert lifecycle behaviour
-     /// rather than DNS-specific outcomes.
-     /// </summary>
-    public class WorkerTests
-     {
-         [Fact]
-        public async Task Shuts_down_gracefully_when_shutdown_is_requested()
-         {
-             var worker = CreateWorker(interval: TimeSpan.FromHours(1));
+    [Fact]
+    public async Task Runs_immediately_waits_after_completion_and_never_overlaps()
+    {
+        var clock = new ManualTimeProvider();
+        var entered = Channel.CreateUnbounded<int>();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        using var worker = Create(clock, async token =>
+        {
+            entered.Writer.TryWrite(Interlocked.Increment(ref calls));
+            await release.Task.WaitAsync(token);
+        });
+        await worker.StartAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(1, await Read(entered.Reader));
+        Assert.Equal(0, clock.TimerCount);
+        Assert.Equal(1, calls);
 
-             await worker.StartAsync(CancellationToken.None);
+        release.SetResult();
+        var timer = await Read(clock.Timers.Reader);
+        Assert.Equal(TimeSpan.FromMinutes(5), timer.DueTime);
+        Assert.Equal(1, calls);
+        timer.Fire();
+        Assert.Equal(2, await Read(entered.Reader));
+        await Stop(worker);
+        Assert.True(worker.ExecuteTask!.IsCompletedSuccessfully);
+    }
 
-             var stop = worker.StopAsync(CancellationToken.None);
-             Assert.True(await CompletedWithinAsync(stop, TimeSpan.FromSeconds(5)),
-                 "The worker did not stop within the expected time after a shutdown request.");
-             await stop;
-         }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Failure_or_timeout_waits_then_retries_without_logging_secrets(bool timeout)
+    {
+        var clock = new ManualTimeProvider();
+        var calls = 0;
+        var retried = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logger = new CapturingLogger<Worker>();
+        using var worker = new Worker(Options.Create(new DdnsOptions { CheckInterval = TimeSpan.FromMinutes(5) }),
+            new StubReconciler(_ =>
+            {
+                if (Interlocked.Increment(ref calls) == 1)
+                    throw timeout ? new OperationCanceledException("secret-token") : new HttpRequestException("secret-token");
+                retried.TrySetResult();
+                return Task.CompletedTask;
+            }), clock, logger);
+        await worker.StartAsync(TestContext.Current.CancellationToken);
+        var timer = await Read(clock.Timers.Reader);
+        Assert.Equal(1, calls);
+        timer.Fire();
+        await retried.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        await Stop(worker);
+        Assert.Equal(2, calls);
+        Assert.Equal(1, logger.MessageCount("cycle failed"));
+        Assert.All(logger.Messages, message => Assert.DoesNotContain("secret-token", message));
+    }
 
-         [Fact]
-        public async Task Repeats_reconciliation_cycles_at_the_configured_interval()
-         {
-             var logger = new CapturingLogger<Worker>();
-             var worker = CreateWorker(interval: TimeSpan.FromMilliseconds(10), logger: logger);
+    [Fact]
+    public async Task Shutdown_cancels_in_flight_work_and_does_not_retry()
+    {
+        var clock = new ManualTimeProvider();
+        var entered = new TaskCompletionSource<CancellationToken>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var worker = Create(clock, async token =>
+        {
+            entered.SetResult(token);
+            await Task.Delay(Timeout.InfiniteTimeSpan, token);
+        });
+        await worker.StartAsync(TestContext.Current.CancellationToken);
+        var token = await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        await Stop(worker);
+        Assert.True(token.IsCancellationRequested);
+        Assert.True(worker.ExecuteTask!.IsCompletedSuccessfully);
+        Assert.Equal(0, clock.TimerCount);
+    }
 
-             await worker.StartAsync(CancellationToken.None);
-              await Task.Delay(150, TestContext.Current.CancellationToken);
+    [Fact]
+    public async Task Shutdown_interrupts_interval_wait()
+    {
+        var clock = new ManualTimeProvider();
+        using var worker = Create(clock, _ => Task.CompletedTask);
+        await worker.StartAsync(TestContext.Current.CancellationToken);
+        var timer = await Read(clock.Timers.Reader);
+        await Stop(worker);
+        Assert.True(timer.Disposed);
+        Assert.True(worker.ExecuteTask!.IsCompletedSuccessfully);
+    }
 
-             var stop = worker.StopAsync(CancellationToken.None);
-             Assert.True(await CompletedWithinAsync(stop, TimeSpan.FromSeconds(5)),
-                 "The worker did not stop within the expected time after a shutdown request.");
-             await stop;
+    private static Worker Create(TimeProvider clock, Func<CancellationToken, Task> action) =>
+        new(Options.Create(new DdnsOptions { CheckInterval = TimeSpan.FromMinutes(5) }),
+            new StubReconciler(action), clock, NullLogger<Worker>.Instance);
 
-             Assert.True(logger.MessageCount("Reconciliation cycle started") >= 2,
-                 "Expected the worker to run multiple reconciliation cycles at the short configured interval.");
-         }
+    private static async Task<T> Read<T>(ChannelReader<T> reader) =>
+        await reader.ReadAsync(TestContext.Current.CancellationToken).AsTask()
+            .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
-         [Fact]
-        public async Task Waits_for_the_configured_interval_before_repeating()
-         {
-             var logger = new CapturingLogger<Worker>();
-             var worker = CreateWorker(interval: TimeSpan.FromHours(1), logger: logger);
+    private static async Task Stop(Worker worker) =>
+        await worker.StopAsync(TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
-             await worker.StartAsync(CancellationToken.None);
+    // Fire delays explicitly, without wall-clock sleeps.
+    private sealed class ManualTimeProvider : TimeProvider
+    {
+        public Channel<ManualTimer> Timers { get; } = Channel.CreateUnbounded<ManualTimer>();
+        private int _timerCount;
+        public int TimerCount => Volatile.Read(ref _timerCount);
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            var timer = new ManualTimer(callback, state, dueTime);
+            Interlocked.Increment(ref _timerCount);
+            Timers.Writer.TryWrite(timer);
+            return timer;
+        }
+    }
 
-             // Let the first cycle run and enter the long interval wait.
-              await Task.Delay(100, TestContext.Current.CancellationToken);
-
-             var stop = worker.StopAsync(CancellationToken.None);
-             Assert.True(await CompletedWithinAsync(stop, TimeSpan.FromSeconds(5)),
-                 "The worker did not stop within the expected time after a shutdown request.");
-             await stop;
-
-             // With a one-hour interval the worker is still in its first wait, so only one
-             // cycle has started: the interval paces execution.
-             Assert.Equal(1, logger.MessageCount("Reconciliation cycle started"));
-         }
-
-        private static Worker CreateWorker(TimeSpan interval, ILogger<Worker>? logger = null)
-         {
-             var options = Options.Create(new DdnsOptions
-              {
-                 CheckInterval = interval,
-                 Cloudflare = new CloudflareOptions
-                  {
-                     ApiToken = "test-token",
-                     Zone = "example.com",
-                     Records = new() { "home" },
-                  },
-              });
-
-             return new Worker(options, logger ?? NullLogger<Worker>.Instance);
-         }
-
-        private static async Task<bool> CompletedWithinAsync(Task task, TimeSpan timeout)
-         {
-              await Task.WhenAny(task, Task.Delay(timeout));
-             return task.IsCompleted;
-         }
-     }
+    private sealed class ManualTimer(TimerCallback callback, object? state, TimeSpan dueTime) : ITimer
+    {
+        public TimeSpan DueTime { get; } = dueTime;
+        public bool Disposed { get; private set; }
+        public void Fire() { if (!Disposed) callback(state); }
+        public bool Change(TimeSpan dueTime, TimeSpan period) => throw new NotSupportedException();
+        public void Dispose() => Disposed = true;
+        public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
+    }
 }

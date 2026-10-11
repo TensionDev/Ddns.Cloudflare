@@ -54,6 +54,20 @@ Responsibilities:
 The worker should not contain Cloudflare API details or public-IP HTTP
 implementation details.
 
+`Worker` delegates each cycle to `DdnsReconciler`, which obtains one public
+IPv4 address and reads and conditionally updates each configured record.
+`IPublicIpProvider` is resolved once at startup from `PUBLIC_IP_PROVIDER`.
+Missing or unknown names select Cloudflare; unknown names produce a warning.
+`CloudflarePublicIpProvider` uses `PUBLIC_IP_CLOUDFLARE_URL` and parses
+Cloudflare trace output. Its endpoint is supplied by configuration, with no
+fallback URL in code. Future services register separate provider classes and
+settings under explicit names. Lookup failures do not change the selection.
+`CloudflareDnsClient` owns zone and record
+discovery and content-only PATCH requests. Named HTTP clients isolate
+Cloudflare authentication from public-IP detection. The worker waits after
+each cycle completes, retries failed cycles, and propagates host cancellation
+through every operation. No state is cached across cycles.
+
 ### Public IP Provider
 
 The public-IP provider determines the IPv4 address visible to the

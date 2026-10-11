@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Hosting;
 using TensionDev.Ddns.Cloudflare.Configuration;
+using TensionDev.Ddns.Cloudflare.Reconciliation;
 
 namespace TensionDev.Ddns.Cloudflare.Tests.Configuration
 {
@@ -19,6 +20,7 @@ namespace TensionDev.Ddns.Cloudflare.Tests.Configuration
         private static IConfiguration BuildConfiguration(string[] settings)
           {
              return new ConfigurationBuilder()
+              .AddInMemoryCollection(new Dictionary<string, string?> { ["PUBLIC_IP_CLOUDFLARE_URL"] = "https://1.1.1.1/cdn-cgi/trace" })
               .AddInMemoryCollection(settings.Select(setting =>
               {
                   var parts = setting.Split('=', 2);
@@ -106,7 +108,13 @@ namespace TensionDev.Ddns.Cloudflare.Tests.Configuration
         [InlineData("CLOUDFLARE_ZONE", "   ")]
         [InlineData("CLOUDFLARE_RECORDS", "")]
         [InlineData("CLOUDFLARE_RECORDS", " , , ")]
-        public async Task Invalid_configuration_fails_at_host_start_without_exposing_token(string key, string value)
+        [InlineData("PUBLIC_IP_CLOUDFLARE_URL", "")]
+        [InlineData("PUBLIC_IP_CLOUDFLARE_URL", null)]
+        [InlineData("PUBLIC_IP_CLOUDFLARE_URL", "relative/path")]
+        [InlineData("PUBLIC_IP_CLOUDFLARE_URL", "http://example.com/ip")]
+        [InlineData("PUBLIC_IP_CLOUDFLARE_URL", "https://user:secret@example.com/ip")]
+        [InlineData("PUBLIC_IP_CLOUDFLARE_URL", "https://example.com/ip#fragment")]
+        public async Task Invalid_configuration_fails_at_host_start_without_exposing_token(string key, string? value)
         {
             const string token = "secret-token-that-must-not-appear";
             var settings = new Dictionary<string, string?>
@@ -114,6 +122,7 @@ namespace TensionDev.Ddns.Cloudflare.Tests.Configuration
                 ["CLOUDFLARE_API_TOKEN"] = token,
                 ["CLOUDFLARE_ZONE"] = "example.com",
                 ["CLOUDFLARE_RECORDS"] = "home",
+                ["PUBLIC_IP_CLOUDFLARE_URL"] = "https://1.1.1.1/cdn-cgi/trace",
                 [key] = value
             };
             var configuration = new ConfigurationBuilder().AddInMemoryCollection(settings).Build();
@@ -141,6 +150,8 @@ namespace TensionDev.Ddns.Cloudflare.Tests.Configuration
                 .ConfigureServices(services =>
                 {
                     services.AddDdnsOptions(configuration);
+                    services.AddSingleton<IDdnsReconciler>(new StubReconciler(_ => Task.CompletedTask));
+                    services.AddSingleton(TimeProvider.System);
                     services.AddSingleton<Microsoft.Extensions.Logging.ILogger<Worker>>(logger);
                     services.AddHostedService<Worker>();
                 })
@@ -163,7 +174,9 @@ namespace TensionDev.Ddns.Cloudflare.Tests.Configuration
                 ["CLOUDFLARE_API_TOKEN"] = "environment-token",
                 ["CLOUDFLARE_ZONE"] = "example.com",
                 ["CLOUDFLARE_RECORDS"] = " home, ,web ",
-                ["CHECK_INTERVAL"] = "00:01:30"
+                ["CHECK_INTERVAL"] = "00:01:30",
+                ["PUBLIC_IP_CLOUDFLARE_URL"] = "https://ip.example.com/address?format=text",
+                ["PUBLIC_IP_PROVIDER"] = " CLOUDFLARE "
             };
             try
             {
@@ -179,6 +192,8 @@ namespace TensionDev.Ddns.Cloudflare.Tests.Configuration
                 Assert.Equal("example.com", options.Cloudflare.Zone);
                 Assert.Equal(new[] { "home", "web" }, options.Cloudflare.Records);
                 Assert.Equal(TimeSpan.FromSeconds(90), options.CheckInterval);
+                Assert.Equal("https://ip.example.com/address?format=text", options.CloudflarePublicIpUrl!.AbsoluteUri);
+                Assert.Equal(" CLOUDFLARE ", options.PublicIpProvider);
             }
             finally
             {
